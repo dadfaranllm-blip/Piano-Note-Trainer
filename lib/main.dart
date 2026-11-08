@@ -541,8 +541,7 @@ class _TrainerPageState extends State<TrainerPage> {
                 const SizedBox(height: 8),
                 FilledButton(onPressed: () => Navigator.pop(sheetContext), child: const Text('بازگشت به تمرین')),
               ]))),
-            )),
-          );
+            ));
         },
       ),
     );
