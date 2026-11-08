@@ -1,0 +1,18 @@
+name: piano_note_trainer
+description: A simple offline Persian piano note reading trainer.
+publish_to: none
+version: 1.3.0+4
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
