@@ -1,4 +1,4 @@
-# نت‌خوان پیانو — نسخه 1.3.4
+# نت‌خوان پیانو — نسخه 1.3.5
 
 این بسته شامل سورس Flutter، تست‌ها، پروژه Android و GitHub Actions برای ساخت APK است.
 
@@ -25,3 +25,8 @@ flutter build apk --release
 ## یادداشت انتشار
 
 تنظیم امضای Release فعلی برای تست داخلی است و از debug signing استفاده می‌کند. برای انتشار عمومی در Google Play باید keystore اختصاصی و امن پیکربندی شود.
+
+
+## ساخت APK در GitHub Actions
+
+Workflow نسخه 1.3.5 پس از اجرای تست‌ها، Gradle 8.14.3 را از توزیع رسمی دریافت و Wrapper را در پوشه واقعی پروژه ایجاد می‌کند. سپس نسخه Wrapper را کنترل کرده و مستقیماً دستور `:app:assembleRelease` را با همان Wrapper اجرا می‌کند تا انتخاب ناخواسته Gradle 8.9 توسط Flutter CLI حذف شود. فایل APK در Artifacts قرار می‌گیرد.
