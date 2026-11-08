@@ -1,0 +1,158 @@
+name: Piano Android Build - Gradle 8.14.3 enforced
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test and build release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter 3.47.9
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Locate Flutter project root
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$GITHUB_WORKSPACE/pubspec.yaml" && -d "$GITHUB_WORKSPACE/android" ]]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+          else
+            PROJECT_DIR=""
+            while IFS= read -r candidate; do
+              if [[ -f "$candidate/pubspec.yaml" && -d "$candidate/android" ]]; then
+                PROJECT_DIR="$candidate"
+                break
+              fi
+            done < <(find "$GITHUB_WORKSPACE" -mindepth 2 -maxdepth 6 -type f -name pubspec.yaml -not -path '*/.dart_tool/*' -printf '%h\n' | sort)
+          fi
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo 'ERROR: Flutter project root not found.'
+            find "$GITHUB_WORKSPACE" -maxdepth 6 -type f \( -name pubspec.yaml -o -name settings.gradle.kts \) -print
+            exit 1
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Selected project root: $PROJECT_DIR"
+          test -f "$PROJECT_DIR/lib/main.dart"
+          test -f "$PROJECT_DIR/android/settings.gradle.kts"
+
+      - name: Print toolchain and project paths
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          echo "PROJECT_DIR=$PWD"
+          flutter --version
+          java -version
+          echo '--- Existing Gradle wrapper configuration ---'
+          if [[ -f android/gradle/wrapper/gradle-wrapper.properties ]]; then
+            cat android/gradle/wrapper/gradle-wrapper.properties
+          else
+            echo 'No wrapper properties found; CI will create them.'
+          fi
+
+      - name: Install Flutter dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Run Flutter tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter test
+
+      # Do not let Flutter's CLI select a stale 8.9 wrapper. Create a fresh
+      # wrapper from the official Gradle 8.14.3 distribution and invoke it
+      # directly for :app:assembleRelease below.
+      - name: Create Gradle 8.14.3 wrapper in the selected project
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=8.14.3
+          ZIP="$RUNNER_TEMP/gradle-${VERSION}-bin.zip"
+          DIR="$RUNNER_TEMP/gradle-${VERSION}"
+          curl --fail --location --retry 4 --retry-delay 3 \
+            "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
+            --output "$ZIP"
+          mkdir -p "$DIR"
+          unzip -q -o "$ZIP" -d "$DIR"
+          GRADLE="$DIR/gradle-${VERSION}/bin/gradle"
+          test -x "$GRADLE"
+          test -f android/local.properties
+          "$GRADLE" -p android wrapper --gradle-version "$VERSION" --distribution-type bin
+          cat > android/gradle/wrapper/gradle-wrapper.properties <<'PROPERTIES'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.3-bin.zip
+          networkTimeout=10000
+          validateDistributionUrl=true
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          PROPERTIES
+          chmod +x android/gradlew
+          test -s android/gradle/wrapper/gradle-wrapper.jar
+          echo '--- Exact wrapper properties after generation ---'
+          cat android/gradle/wrapper/gradle-wrapper.properties
+          grep -Fq 'gradle-8.14.3-bin.zip' android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Verify wrapper runtime and fail if not 8.14.3
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Android project directory: $PWD"
+          echo '--- Wrapper distribution URL ---'
+          grep '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties
+          grep -Fq 'gradle-8.14.3-bin.zip' gradle/wrapper/gradle-wrapper.properties
+          ./gradlew --stop || true
+          ./gradlew --version | tee "$RUNNER_TEMP/verified-gradle.txt"
+          grep -Eq '^Gradle 8\.14\.3$' "$RUNNER_TEMP/verified-gradle.txt"
+
+      - name: Build Release APK using verified Gradle wrapper
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Building with the exact wrapper verified in the previous step.'
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+          APK="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+          if [[ ! -s "$APK" ]]; then
+            GRADLE_APK="$PROJECT_DIR/build/app/outputs/apk/release/app-release.apk"
+            if [[ -s "$GRADLE_APK" ]]; then
+              mkdir -p "$PROJECT_DIR/build/app/outputs/flutter-apk"
+              cp "$GRADLE_APK" "$APK"
+            fi
+          fi
+          if [[ ! -s "$APK" ]]; then
+            echo 'APK not found. Build output candidates:'
+            find "$PROJECT_DIR" -type f -name '*.apk' -print || true
+            exit 1
+          fi
+          sha256sum "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: piano-note-trainer-android-v1.3.5
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
