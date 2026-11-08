@@ -51,4 +51,20 @@ void main() {
   test('Five speeds', () {
     expect(Pace.values.map((e) => e.seconds).toList(), [0, 12, 8, 5, 3]);
   });
+
+  test('Tempo multiplier changes song speed within safe bounds', () {
+    expect(effectiveTempo(80, 50), 40);
+    expect(effectiveTempo(120, 150), 180);
+    expect(effectiveTempo(40, 25), 20);
+    expect(effectiveTempo(160, 200), 320);
+  });
+
+  test('Middle C octave is the default practice range and octave selection is independent', () {
+    final middle = notesForSelection({4}, {...noteLetters});
+    expect(middle.length, 7);
+    expect(middle.first.latin, 'C4');
+    expect(middle.last.latin, 'B4');
+    final selected = notesForSelection({3, 5}, {'C', 'G'});
+    expect(selected.map((n) => n.latin).toSet(), {'C3', 'G3', 'C5', 'G5'});
+  });
 }

@@ -6,7 +6,8 @@ import 'package:flutter/services.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+  // Allow both portrait and landscape; the user can lock a preferred mode in settings.
+  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp, DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
   runApp(const PianoTrainerApp());
 }
 
@@ -17,6 +18,7 @@ const noteSemitones = [0, 2, 4, 5, 7, 9, 11];
 enum NoteNames { persian, english, both }
 enum Clef { treble, bass }
 enum Drill { single, melody, song }
+enum SongPlayMode { staff, falling, combined }
 enum Pace {
   free('آزاد', 0), slow('آرام', 12), normal('متوسط', 8),
   fast('سریع', 5), expert('چالشی', 3);
@@ -48,6 +50,10 @@ final List<MusicNote> allNotes = List.unmodifiable([
           12 * (octave + 1) + noteSemitones[index],
           (octave - 4) * 7 + index),
 ]);
+
+List<MusicNote> notesForSelection(Set<int> octaves, Set<String> letters) => allNotes.where((n) => octaves.contains(n.octave) && letters.contains(n.letter)).toList(growable: false);
+
+int effectiveTempo(int baseBpm, int speedPercent) => (baseBpm * speedPercent / 100).round().clamp(20, 320).toInt();
 
 // Treble: E4 bottom, F5 top; bass: G2 bottom, A3 top.
 // Return distance in staff diatonic steps from bottom line.
@@ -107,12 +113,31 @@ class TrainerPage extends StatefulWidget {
   State<TrainerPage> createState() => _TrainerPageState();
 }
 
-class _TrainerPageState extends State<TrainerPage> {
+class _TrainerPageState extends State<TrainerPage> with WidgetsBindingObserver {
   static const sound = MethodChannel('piano_note_trainer/sound');
   static const storage = MethodChannel('piano_note_trainer/storage');
   final random = Random();
   final Map<int, int> mistakes = {};
   final Set<String> selectedLetters = {...noteLetters};
+  final Set<int> selectedOctaves = {4};
+  final List<int> questionBag = [];
+  String questionBagSignature = '';
+  SongPlayMode songPlayMode = SongPlayMode.staff;
+  final Map<String, SongPlayMode> songModes = {};
+  SongPlayMode get activeSongPlayMode => songModes[chosenSong] ?? songPlayMode;
+  int speedPercent = 100;
+  bool autoSpeed = false;
+  int successfulSongStreak = 0;
+  String orientationMode = 'auto';
+  bool reminderEnabled = false;
+  int reminderHour = 19;
+  int reminderMinute = 0;
+  final Map<String, int> practiceSecondsByDay = {};
+  final Map<String, int> correctByDay = {};
+  final Map<String, int> attemptsByDay = {};
+  Timer? activityTimer;
+  int secondsSinceSave = 0;
+  bool inactivitySaved = false;
   NoteNames naming = NoteNames.both;
   Clef clef = Clef.treble;
   Drill drill = Drill.single;
@@ -123,6 +148,8 @@ class _TrainerPageState extends State<TrainerPage> {
   int rhythmErrors = 0;
   int rhythmSuccess = 0;
   DateTime? songStartTime;
+  DateTime? lastPracticeInteraction;
+  final Set<int> songErroredIndices = {};
   bool checkRhythm = true;
   int bpm = 80;
   final Set<String> completedLessons = {};
@@ -146,43 +173,130 @@ class _TrainerPageState extends State<TrainerPage> {
   List<MusicNote> phrase = [];
   Timer? ticker;
   Timer? transition;
+  Timer? fallingMissTimer;
 
   MusicNote get target => phrase[melodyIndex];
   PracticeSong get currentSong => practiceSongs.firstWhere((s) => s.id == chosenSong);
   Clef get effectiveClef => drill == Drill.song ? Clef.treble : clef;
-  int get effectiveOctave => drill == Drill.song ? 4 : firstOctave;
-  int get firstOctave => clef == Clef.treble ? 4 : 2;
-  int get maxStep => stage == 1 ? 2 : stage == 2 ? 4 : stage == 3 ? 7 : 14;
+  int get effectiveOctave => drill == Drill.song ? 4 : (selectedOctaves.isEmpty ? 4 : selectedOctaves.reduce(min));
+  int get effectiveOctaveCount => drill == Drill.song ? 2 : max(1, (selectedOctaves.isEmpty ? 4 : selectedOctaves.reduce(max)) - effectiveOctave + 1).toInt();
+  int get effectiveBpm => effectiveTempo(bpm, speedPercent);
+  String get todayKey => _dayKey(DateTime.now());
+  String get selectedOctaveLabel { final values = selectedOctaves.toList()..sort(); return values.join(', '); }
+  static String _dayKey(DateTime d) => '${d.year.toString().padLeft(4,"0")}-${d.month.toString().padLeft(2,"0")}-${d.day.toString().padLeft(2,"0")}';
 
-  List<MusicNote> get pool {
-    final first = clef == Clef.bass ? -10 : 0;
-    final available = allNotes.where((n) =>
-      n.step >= first && n.step <= first + maxStep && selectedLetters.contains(n.letter)).toList();
-    // When selected pitches fall outside an early stage, use the selected
-    // pitches in the full two-octave span rather than show an empty drill.
-    if (available.isNotEmpty) return available;
-    return allNotes.where((n) => n.step >= first &&
-      n.step <= first + 14 && selectedLetters.contains(n.letter)).toList();
-  }
+  List<MusicNote> get pool => notesForSelection(selectedOctaves, selectedLetters);
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     phrase = [allNotes.firstWhere((n) => n.midi == 60)];
     WidgetsBinding.instance.addPostFrameCallback((_) { if (mounted) restoreProgress(); });
   }
 
-  MusicNote choose(List<MusicNote> options) {
-    if (!smartPractice || options.length == 1) return options[random.nextInt(options.length)];
-    final weighted = <MusicNote>[];
-    for (final n in options) {
-      final copies = (1 + (mistakes[n.midi] ?? 0)).clamp(1, 5);
-      for (var i = 0; i < copies; i++) { weighted.add(n); }
+  MusicNote choose(List<MusicNote> options, {int? previousMidi}) {
+    if (options.isEmpty) throw StateError('No notes selected for practice.');
+    final ids = options.map((n) => n.midi).toList()..sort();
+    final signature = '${ids.join(',')}:${smartPractice ? 1 : 0}';
+    if (questionBag.isEmpty || questionBagSignature != signature) {
+      questionBagSignature = signature;
+      questionBag..clear()..addAll(ids)..shuffle(random);
+      // Smart review is appended after every selected note has appeared once.
+      if (smartPractice) {
+        final review = <int>[];
+        for (final note in options) {
+          final extra = ((mistakes[note.midi] ?? 0) ~/ 2).clamp(0, 3);
+          for (var i = 0; i < extra; i++) { review.add(note.midi); }
+        }
+        review.shuffle(random);
+        questionBag.addAll(review);
+      }
     }
-    return weighted[random.nextInt(weighted.length)];
+    final previous = previousMidi ?? (phrase.isNotEmpty ? phrase.last.midi : -1);
+    if (questionBag.length > 1 && questionBag.first == previous) {
+      final alternative = questionBag.indexWhere((midi) => midi != previous);
+      if (alternative > 0) {
+        final first = questionBag[0];
+        questionBag[0] = questionBag[alternative];
+        questionBag[alternative] = first;
+      }
+    }
+    final selected = questionBag.removeAt(0);
+    return options.firstWhere((note) => note.midi == selected);
   }
 
-  void cancelTimers() { ticker?.cancel(); transition?.cancel(); }
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (loaded) startActivityClock();
+    } else {
+      activityTimer?.cancel();
+      saveProgress();
+    }
+  }
+
+  void startActivityClock() {
+    activityTimer?.cancel();
+    activityTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !loaded) return;
+      final lastInput = lastPracticeInteraction;
+      if (lastInput == null || DateTime.now().difference(lastInput) > const Duration(minutes: 2)) {
+        if (!inactivitySaved) { inactivitySaved = true; saveProgress(); }
+        return;
+      }
+      final key = todayKey;
+      practiceSecondsByDay[key] = (practiceSecondsByDay[key] ?? 0) + 1;
+      secondsSinceSave++;
+      if (secondsSinceSave >= 10) {
+        secondsSinceSave = 0;
+        saveProgress();
+      }
+      if (mounted) setState(() {});
+    });
+  }
+
+  void recordAnswer(bool isCorrect) {
+    final key = todayKey;
+    attemptsByDay[key] = (attemptsByDay[key] ?? 0) + 1;
+    if (isCorrect) correctByDay[key] = (correctByDay[key] ?? 0) + 1;
+  }
+
+  Future<void> setOrientation(String mode) async {
+    orientationMode = mode;
+    final orientations = mode == 'portrait'
+      ? [DeviceOrientation.portraitUp]
+      : mode == 'landscape'
+        ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
+        : [DeviceOrientation.portraitUp, DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight];
+    await SystemChrome.setPreferredOrientations(orientations);
+    if (mounted) setState(() {});
+    saveProgress();
+  }
+
+  Future<void> configureReminder(bool enabled, int hour, int minute) async {
+    reminderEnabled = enabled;
+    reminderHour = hour;
+    reminderMinute = minute;
+    try {
+      await const MethodChannel('piano_note_trainer/reminders').invokeMethod<void>(
+        'configure', {'enabled': enabled, 'hour': hour, 'minute': minute});
+    } catch (_) { /* The app remains usable if the native reminder bridge is unavailable. */ }
+    if (mounted) setState(() {});
+    saveProgress();
+  }
+
+  Future<void> openDashboard() async {
+    lastPracticeInteraction = null;
+    cancelTimers();
+    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) =>
+      Directionality(textDirection: TextDirection.rtl, child: ProgressDashboard(
+        secondsByDay: Map.of(practiceSecondsByDay), correctByDay: Map.of(correctByDay),
+        attemptsByDay: Map.of(attemptsByDay)))));
+    if (mounted) newQuestion();
+  }
+
+  void cancelTimers() { ticker?.cancel(); transition?.cancel(); fallingMissTimer?.cancel(); }
 
   Future<void> restoreProgress() async {
     try {
@@ -195,6 +309,18 @@ class _TrainerPageState extends State<TrainerPage> {
           attempts = (data['attempts'] as num?)?.toInt() ?? 0;
           completedSongs = (data['completedSongs'] as num?)?.toInt() ?? 0;
           checkRhythm = data['checkRhythm'] != false;
+          speedPercent = ((data['speedPercent'] as num?)?.toInt() ?? 100).clamp(25, 200).toInt();
+          autoSpeed = data['autoSpeed'] == true;
+          successfulSongStreak = (data['successfulSongStreak'] as num?)?.toInt() ?? 0;
+          songPlayMode = SongPlayMode.values.firstWhere((v) => v.name == data['songPlayMode'], orElse: () => SongPlayMode.staff);
+          for (final entry in (data['songModes'] as Map? ?? {}).entries) { songModes[entry.key.toString()] = SongPlayMode.values.firstWhere((v) => v.name == entry.value, orElse: () => SongPlayMode.staff); }
+          orientationMode = (data['orientationMode'] as String?) ?? 'auto';
+          reminderEnabled = data['reminderEnabled'] == true;
+          reminderHour = ((data['reminderHour'] as num?)?.toInt() ?? 19).clamp(0, 23).toInt();
+          reminderMinute = ((data['reminderMinute'] as num?)?.toInt() ?? 0).clamp(0, 59).toInt();
+          for (final entry in (data['practiceSecondsByDay'] as Map? ?? {}).entries) { if (entry.value is num) practiceSecondsByDay[entry.key.toString()] = (entry.value as num).toInt(); }
+          for (final entry in (data['correctByDay'] as Map? ?? {}).entries) { if (entry.value is num) correctByDay[entry.key.toString()] = (entry.value as num).toInt(); }
+          for (final entry in (data['attemptsByDay'] as Map? ?? {}).entries) { if (entry.value is num) attemptsByDay[entry.key.toString()] = (entry.value as num).toInt(); }
           bpm = ((data['bpm'] as num?)?.toInt() ?? 80).clamp(40, 160).toInt();
           completedLessons.addAll((data['completedLessons'] as List? ?? []).whereType<String>());
           for (final entry in (data['lessonScores'] as Map? ?? {}).entries) {
@@ -215,6 +341,8 @@ class _TrainerPageState extends State<TrainerPage> {
           chosenSong = practiceSongs.any((v) => v.id == data['chosenSong']) ? data['chosenSong'] as String : 'steps';
           smartPractice = data['smartPractice'] != false;
           showKeyLabels = data['showKeyLabels'] != false;
+          final octaves = data['selectedOctaves'];
+          if (octaves is List) { final valid = octaves.whereType<num>().map((v) => v.toInt()).where((v) => v >= 2 && v <= 6).toSet(); if (valid.isNotEmpty) selectedOctaves..clear()..addAll(valid); }
           final previousSelection = data['selectedLetters'];
           if (previousSelection is List) {
             final valid = previousSelection.whereType<String>().where(noteLetters.contains).toSet();
@@ -225,6 +353,9 @@ class _TrainerPageState extends State<TrainerPage> {
     } catch (_) { /* Malformed or unsupported storage: safely use defaults. */ }
     if (!mounted) return;
     loaded = true;
+    if (orientationMode == 'portrait' || orientationMode == 'landscape') { await setOrientation(orientationMode); }
+    if (reminderEnabled) { await configureReminder(true, reminderHour, reminderMinute); }
+    startActivityClock();
     newQuestion();
   }
 
@@ -236,11 +367,15 @@ class _TrainerPageState extends State<TrainerPage> {
       'naming': naming.name, 'clef': clef.name, 'drill': drill.name,
       'pace': pace.name, 'stage': stage, 'chosenSong': chosenSong,
       'smartPractice': smartPractice, 'showKeyLabels': showKeyLabels,
-      'selectedLetters': selectedLetters.toList(),
+      'selectedLetters': selectedLetters.toList(), 'selectedOctaves': selectedOctaves.toList(),
+      'songPlayMode': songPlayMode.name, 'songModes': songModes.map((k,v) => MapEntry(k,v.name)), 'speedPercent': speedPercent, 'autoSpeed': autoSpeed,
+      'successfulSongStreak': successfulSongStreak, 'orientationMode': orientationMode,
+      'reminderEnabled': reminderEnabled, 'reminderHour': reminderHour, 'reminderMinute': reminderMinute,
+      'practiceSecondsByDay': practiceSecondsByDay, 'correctByDay': correctByDay, 'attemptsByDay': attemptsByDay,
       'checkRhythm': checkRhythm, 'bpm': bpm,
       'completedLessons': completedLessons.toList(), 'lessonScores': lessonScores,
     });
-    try { await storage.invokeMethod<void>('write', {'json': encoded}); }
+    try { await storage.invokeMethod<void>('write', {'json': encoded}); await const MethodChannel('piano_note_trainer/widget').invokeMethod<void>('update'); }
     catch (_) { /* Don't block training if storage is unavailable. */ }
   }
 
@@ -253,8 +388,11 @@ class _TrainerPageState extends State<TrainerPage> {
       setState(() {
         phrase = currentSong.notes;
         melodyIndex = 0;
+        songStartTime = activeSongPlayMode == SongPlayMode.falling || activeSongPlayMode == SongPlayMode.combined
+          ? DateTime.now().add(const Duration(milliseconds: 1800)) : null;
         songErrors = 0;
-        rhythmErrors = 0; rhythmSuccess = 0; songStartTime = null;
+        songErroredIndices.clear();
+        rhythmErrors = 0; rhythmSuccess = 0;
         questionSerial++;
         locked = false;
         revealAnswer = false;
@@ -264,14 +402,14 @@ class _TrainerPageState extends State<TrainerPage> {
         statusColor = const Color(0xFF53665D);
       });
       beginTimer();
+      if (activeSongPlayMode != SongPlayMode.staff) scheduleFallingMiss();
       return;
     }
-    final prior = phrase.isNotEmpty ? phrase.last.midi : -1;
-    final firstOptions = choices.length > 1
-        ? choices.where((n) => n.midi != prior).toList() : choices;
-    final next = <MusicNote>[choose(firstOptions)];
-    if (drill == Drill.melody) {
-      for (var i = 1; i < 4; i++) { next.add(choose(choices)); }
+    final next = <MusicNote>[];
+    final noteCount = drill == Drill.melody ? 4 : 1;
+    for (var i = 0; i < noteCount; i++) {
+      final previous = next.isNotEmpty ? next.last.midi : (phrase.isNotEmpty ? phrase.last.midi : null);
+      next.add(choose(choices, previousMidi: previous));
     }
     setState(() {
       phrase = next;
@@ -321,17 +459,27 @@ class _TrainerPageState extends State<TrainerPage> {
   }
 
   Future<void> playSound(int midi) async {
-    try { await sound.invokeMethod<void>('playNote', {'midi': midi}); }
+    lastPracticeInteraction = DateTime.now();
+    inactivitySaved = false;
+    try { await sound.invokeMethod<void>('startNote', {'midi': midi}); }
     on MissingPluginException { /* Training remains functional without audio. */ }
     catch (_) { /* Audio failure is non-fatal. */ }
   }
 
+  Future<void> stopSound(int midi) async {
+    try { await sound.invokeMethod<void>('stopNote', {'midi': midi}); }
+    catch (_) { /* Ignore audio teardown errors. */ }
+  }
+
   void onKey(int midi, Duration held) {
+    stopSound(midi);
+    lastPracticeInteraction = DateTime.now();
+    inactivitySaved = false;
     if (locked) return;
     final answeredNote = target;
     final answer = midi == answeredNote.midi;
     final expectedBeats = drill == Drill.song ? currentSong.beats[melodyIndex] : 1.0;
-    final expectedMs = expectedBeats * 60000 / bpm;
+    final expectedMs = expectedBeats * 60000 / effectiveBpm;
     // An absolute floor accommodates Android touch latency and short notes.
     final toleranceMs = max(140.0, expectedMs * 0.35);
     // The first correct note establishes beat zero. Later notes must start
@@ -342,17 +490,31 @@ class _TrainerPageState extends State<TrainerPage> {
       songStartTime = touchStarted;
     }
     final expectedStartMs = drill == Drill.song
-      ? currentSong.beats.take(melodyIndex).fold<double>(0, (a, b) => a + b) * 60000 / bpm
+      ? currentSong.beats.take(melodyIndex).fold<double>(0, (a, b) => a + b) * 60000 / effectiveBpm
       : 0.0;
     final attackErrorMs = songStartTime == null ? 0.0
-      : (touchStarted.difference(songStartTime!).inMilliseconds - expectedStartMs).abs();
+      : (touchStarted.difference(songStartTime!).inMilliseconds - expectedStartMs).toDouble();
+    final timingTolerance = (activeSongPlayMode == SongPlayMode.falling || activeSongPlayMode == SongPlayMode.combined)
+      ? max(170.0, expectedMs * .28) : toleranceMs;
     final rhythmicMatch = (held.inMilliseconds - expectedMs).abs() <= toleranceMs
-      && attackErrorMs <= toleranceMs;
+      && (activeSongPlayMode == SongPlayMode.staff || attackErrorMs.abs() <= timingTolerance);
+    final fallingMode = drill == Drill.song && activeSongPlayMode != SongPlayMode.staff;
+    if (fallingMode && answer && attackErrorMs < -timingTolerance) {
+      setState(() { pressedMidi = midi; status = 'کمی صبر کن؛ نت هنوز به خط اجرا نرسیده است'; statusColor = const Color(0xFFC18A35); });
+      return;
+    }
+    if (fallingMode && answer && attackErrorMs > timingTolerance) {
+      handleFallingMiss();
+      return;
+    }
     setState(() {
       attempts++;
+      recordAnswer(answer);
       pressedMidi = midi;
       if (answer) {
         correct++;
+        final remainingMistakes = (mistakes[answeredNote.midi] ?? 0) - 1;
+        mistakes[answeredNote.midi] = max(0, remainingMistakes);
         streak++;
         if (drill == Drill.song && checkRhythm) {
           if (rhythmicMatch) { rhythmSuccess++; } else { rhythmErrors++; }
@@ -366,6 +528,7 @@ class _TrainerPageState extends State<TrainerPage> {
             : '✓ درست! ${answeredNote.label(naming)} — نت بعدی';
           secondsLeft = pace.seconds;
           beginTimer();
+          if (fallingMode) scheduleFallingMiss();
         } else {
           locked = true;
           status = (drill == Drill.song && checkRhythm && !rhythmicMatch)
@@ -375,7 +538,10 @@ class _TrainerPageState extends State<TrainerPage> {
       } else {
         streak = 0;
         mistakes[answeredNote.midi] = (mistakes[answeredNote.midi] ?? 0) + 1;
-        if (drill == Drill.song) songErrors++;
+        if (drill == Drill.song) {
+          if (fallingMode) { if (songErroredIndices.add(melodyIndex)) songErrors++; }
+          else { songErrors++; }
+        }
         status = '✕ درست نبود؛ دوباره امتحان کن';
         statusColor = const Color(0xFFC15C4E);
       }
@@ -383,36 +549,101 @@ class _TrainerPageState extends State<TrainerPage> {
     saveProgress();
     if (locked && answer) {
       if (drill == Drill.song) {
-        ticker?.cancel();
-        final pitchScore = (100 * phrase.length / (phrase.length + songErrors)).round();
-        final rhythmScore = checkRhythm ? (100 * rhythmSuccess / phrase.length).round() : 100;
-        final score = checkRhythm ? ((pitchScore + rhythmScore) / 2).round() : pitchScore;
-        bestSongScores[chosenSong] = max(bestSongScores[chosenSong] ?? 0, score);
-        completedSongs++;
-        saveProgress();
-        final serial = questionSerial;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted || serial != questionSerial) return;
-          showDialog<void>(context: context, barrierDismissible: false,
-            builder: (dialogContext) => AlertDialog(
-              title: const Text('آهنگ تمام شد! 🎵'),
-              content: Text('آهنگ: ${currentSong.title}\nامتیاز کل: $score از ۱۰۰\nدقت نت: $pitchScore٪\nدقت کشش: ${checkRhythm ? '$rhythmScore٪' : 'غیرفعال'}\nاشتباه نت: $songErrors\nبهترین امتیاز: ${bestSongScores[chosenSong]}'),
-              actions: [
-                TextButton(onPressed: () { Navigator.pop(dialogContext); newQuestion(); },
-                  child: const Text('دوباره اجرا کن')),
-                FilledButton(onPressed: () { Navigator.pop(dialogContext); updateSettings(() => drill = Drill.single); },
-                  child: const Text('تمرین نت‌خوانی')),
-              ],
-            ),
-          );
-        });
+        finishSong();
       } else { scheduleNext(); }
     }
   }
 
+  void scheduleFallingMiss() {
+    fallingMissTimer?.cancel();
+    if (songStartTime == null || melodyIndex >= currentSong.notes.length) return;
+    final elapsedBeats = currentSong.beats.take(melodyIndex).fold<double>(0, (a, b) => a + b);
+    final dueAt = songStartTime!.add(Duration(milliseconds: (elapsedBeats * 60000 / effectiveBpm).round()));
+    final deadline = dueAt.add(const Duration(milliseconds: 420));
+    final delay = deadline.difference(DateTime.now());
+    fallingMissTimer = Timer(delay.isNegative ? Duration.zero : delay, () {
+      if (!mounted || locked || drill != Drill.song || activeSongPlayMode == SongPlayMode.staff) return;
+      handleFallingMiss();
+    });
+  }
+
+  void handleFallingMiss() {
+    if (locked || drill != Drill.song || melodyIndex >= phrase.length) return;
+    fallingMissTimer?.cancel();
+    final missed = target;
+    setState(() {
+      attempts++;
+      recordAnswer(false);
+      if (songErroredIndices.add(melodyIndex)) songErrors++;
+      rhythmErrors++;
+      mistakes[missed.midi] = (mistakes[missed.midi] ?? 0) + 1;
+      streak = 0;
+      pressedMidi = null;
+      if (melodyIndex < phrase.length - 1) {
+        melodyIndex++;
+        status = 'نت از دست رفت: ${missed.label(naming)}؛ نت بعدی';
+        statusColor = const Color(0xFFC15C4E);
+      } else {
+        locked = true;
+        status = 'پایان آهنگ؛ یک نت از دست رفت';
+        statusColor = const Color(0xFFC15C4E);
+      }
+    });
+    saveProgress();
+    if (locked) { finishSong(); } else { scheduleFallingMiss(); }
+  }
+
+  void finishSong() {
+    fallingMissTimer?.cancel();
+    ticker?.cancel();
+    final pitchScore = (100 * phrase.length / (phrase.length + songErrors)).round();
+    final rhythmScore = checkRhythm ? (100 * rhythmSuccess / phrase.length).round() : 100;
+    final score = checkRhythm ? ((pitchScore + rhythmScore) / 2).round() : pitchScore;
+    bestSongScores[chosenSong] = max(bestSongScores[chosenSong] ?? 0, score);
+    completedSongs++;
+    if (autoSpeed && score >= 90) {
+      successfulSongStreak++;
+      if (successfulSongStreak >= 3) {
+        speedPercent = (speedPercent + 10).clamp(25, 200).toInt();
+        successfulSongStreak = 0;
+      }
+    } else if (score < 90) { successfulSongStreak = 0; }
+    saveProgress();
+    final serial = questionSerial;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || serial != questionSerial) return;
+      showDialog<void>(context: context, barrierDismissible: false,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('آهنگ تمام شد! 🎵'),
+          content: Text('آهنگ: ${currentSong.title}\nامتیاز کل: $score از ۱۰۰\nدقت نت: $pitchScore٪\nدقت ریتم: ${checkRhythm ? '$rhythmScore٪' : 'غیرفعال'}\nخطا و نت ازدست‌رفته: $songErrors\nبهترین امتیاز: ${bestSongScores[chosenSong]}'),
+          actions: [
+            TextButton(onPressed: () { Navigator.pop(dialogContext); newQuestion(); }, child: const Text('دوباره اجرا کن')),
+            FilledButton(onPressed: () { Navigator.pop(dialogContext); updateSettings(() => drill = Drill.single); }, child: const Text('تمرین نت‌خوانی')),
+          ],
+        ),
+      );
+    });
+  }
+
   void updateSettings(VoidCallback change) {
     setState(change);
+    questionBag.clear();
     newQuestion();
+    saveProgress();
+  }
+
+  void setSongSpeed(int value) {
+    final next = value.clamp(25, 200).toInt();
+    if (next == speedPercent) return;
+    setState(() {
+      speedPercent = next;
+      if (drill == Drill.song && songStartTime != null && melodyIndex < currentSong.beats.length) {
+        final elapsedBeats = currentSong.beats.take(melodyIndex).fold<double>(0, (a, b) => a + b);
+        final offset = Duration(milliseconds: (elapsedBeats * 60000 / effectiveBpm).round());
+        songStartTime = DateTime.now().add(const Duration(milliseconds: 1200)).subtract(offset);
+      }
+    });
+    if (drill == Drill.song && activeSongPlayMode != SongPlayMode.staff) scheduleFallingMiss();
     saveProgress();
   }
 
@@ -423,10 +654,11 @@ class _TrainerPageState extends State<TrainerPage> {
   }
 
   @override
-  void dispose() { cancelTimers(); super.dispose(); }
+  void dispose() { WidgetsBinding.instance.removeObserver(this); cancelTimers(); activityTimer?.cancel(); super.dispose(); }
 
   Future<void> openTheory() async {
-    ticker?.cancel();
+    lastPracticeInteraction = null;
+    cancelTimers();
     await Navigator.of(context).push(MaterialPageRoute<void>(
       builder: (context) => Directionality(textDirection: TextDirection.rtl,
         child: TheoryPage(
@@ -441,10 +673,12 @@ class _TrainerPageState extends State<TrainerPage> {
           },
         )),
     ));
-    if (mounted && !locked) beginTimer();
+    if (mounted) newQuestion();
   }
 
   Future<void> openSettings() async {
+    lastPracticeInteraction = null;
+    cancelTimers();
     await showModalBottomSheet<void>(
       context: context, isScrollControlled: true, showDragHandle: true,
       builder: (sheetContext) => StatefulBuilder(
@@ -471,9 +705,16 @@ class _TrainerPageState extends State<TrainerPage> {
                     onSelected: (_) => change(() => naming = NoteNames.both)),
                 ]),
                 const SizedBox(height: 8),
+                const Text('اکتاوهای مورد تمرین', style: TextStyle(fontWeight: FontWeight.bold)),
+                const Text('اکتاو ۴ (دو وسط پیانو) پیش‌فرض است؛ هر تعداد اکتاو را می‌توانی انتخاب کنی.', style: TextStyle(fontSize: 12)),
+                Wrap(spacing: 6, children: [
+                  for (var octave = 2; octave <= 6; octave++)
+                    FilterChip(label: Text('اکتاو $octave'), selected: selectedOctaves.contains(octave),
+                      onSelected: (v) { if (!v && selectedOctaves.length == 1) return; change(() { if (v) selectedOctaves.add(octave); else selectedOctaves.remove(octave); questionBag.clear(); }); }),
+                ]),
+                const SizedBox(height: 8),
                 const Text('نت‌های مورد تمرین', style: TextStyle(fontWeight: FontWeight.bold)),
-                const Text('حداقل یک نت باید انتخاب شود. این انتخاب در تمام اکتاوهای مرحله اعمال می‌شود.',
-                  style: TextStyle(fontSize: 12)),
+                const Text('انتخاب نت‌ها در تمام اکتاوهای انتخاب‌شده اعمال می‌شود.', style: TextStyle(fontSize: 12)),
                 Wrap(spacing: 5, runSpacing: 0, children: [
                   for (var i = 0; i < noteLetters.length; i++)
                     FilterChip(label: Text('${persianLetters[i]} / ${noteLetters[i]}'),
@@ -484,17 +725,6 @@ class _TrainerPageState extends State<TrainerPage> {
                           else { selectedLetters.remove(noteLetters[i]); } });
                       }),
                 ]),
-                const SizedBox(height: 8),
-                const Text('مرحله آموزشی', style: TextStyle(fontWeight: FontWeight.bold)),
-                Wrap(spacing: 6, children: [
-                  for (var i = 1; i <= 4; i++)
-                    ChoiceChip(label: Text('مرحله $i'), selected: stage == i,
-                      onSelected: (_) => change(() => stage = i)),
-                ]),
-                Text(switch (stage) {
-                  1 => '۳ نت اول اکتاو', 2 => '۵ نت اول اکتاو',
-                  3 => 'یک اکتاو کامل', _ => 'دو اکتاو کامل',
-                }, style: const TextStyle(fontSize: 12)),
                 const SizedBox(height: 8),
                 const Text('کلید موسیقی', style: TextStyle(fontWeight: FontWeight.bold)),
                 Wrap(spacing: 7, children: [
@@ -524,6 +754,15 @@ class _TrainerPageState extends State<TrainerPage> {
                       onChanged: (v) { if (v != null) change(() => chosenSong = v); }),
                 ],
                 if (drill == Drill.song) ...[
+                  const Text('روش اجرای آهنگ', style: TextStyle(fontWeight: FontWeight.bold)),
+                  Wrap(spacing: 6, children: [
+                    ChoiceChip(label: const Text('نت روی حامل'), selected: activeSongPlayMode == SongPlayMode.staff, onSelected: (_) => change(() => songModes[chosenSong] = SongPlayMode.staff)),
+                    ChoiceChip(label: const Text('نت‌های سقوط‌کننده'), selected: activeSongPlayMode == SongPlayMode.falling, onSelected: (_) => change(() => songModes[chosenSong] = SongPlayMode.falling)),
+                    ChoiceChip(label: const Text('حالت ترکیبی'), selected: activeSongPlayMode == SongPlayMode.combined, onSelected: (_) => change(() => songModes[chosenSong] = SongPlayMode.combined)),
+                  ]),
+                  Text('سرعت آهنگ: $speedPercent٪ • تمپوی مؤثر: $effectiveBpm BPM', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  Slider(min: 25, max: 200, divisions: 35, value: speedPercent.toDouble(), label: '$speedPercent٪', onChanged: (v) { setSongSpeed(v.round()); refreshSheet(() {}); }),
+                  SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('افزایش تدریجی سرعت پس از سه اجرای موفق'), value: autoSpeed, onChanged: (v) => change(() => autoSpeed = v)),
                   SwitchListTile(contentPadding: EdgeInsets.zero,
                     title: const Text('بررسی کشش و زمان نگه‌داشتن کلاویه'),
                     subtitle: const Text('از لحظه لمس تا رها کردن کلید اندازه‌گیری می‌شود.'),
@@ -538,6 +777,16 @@ class _TrainerPageState extends State<TrainerPage> {
                 SwitchListTile(contentPadding: EdgeInsets.zero,
                   title: const Text('نمایش نام نت روی کلاویه‌ها'),
                   value: showKeyLabels, onChanged: (v) => change(() => showKeyLabels = v)),
+                const Divider(),
+                const Text('جهت صفحه', style: TextStyle(fontWeight: FontWeight.bold)),
+                Wrap(spacing: 6, children: [
+                  ChoiceChip(label: const Text('خودکار'), selected: orientationMode == 'auto', onSelected: (_) { setOrientation('auto'); refreshSheet(() {}); }),
+                  ChoiceChip(label: const Text('عمودی'), selected: orientationMode == 'portrait', onSelected: (_) { setOrientation('portrait'); refreshSheet(() {}); }),
+                  ChoiceChip(label: const Text('افقی'), selected: orientationMode == 'landscape', onSelected: (_) { setOrientation('landscape'); refreshSheet(() {}); }),
+                ]),
+                const Divider(),
+                SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('یادآور روزانه تمرین'), subtitle: Text('ساعت: ${reminderHour.toString().padLeft(2,"0")}:${reminderMinute.toString().padLeft(2,"0")}'), value: reminderEnabled, onChanged: (v) { configureReminder(v, reminderHour, reminderMinute); refreshSheet(() {}); }),
+                Align(alignment: Alignment.centerRight, child: OutlinedButton.icon(icon: const Icon(Icons.schedule), label: const Text('انتخاب ساعت یادآوری'), onPressed: () async { final picked = await showTimePicker(context: sheetContext, initialTime: TimeOfDay(hour: reminderHour, minute: reminderMinute)); if (picked != null) { change(() { reminderHour = picked.hour; reminderMinute = picked.minute; }); if (reminderEnabled) configureReminder(true, picked.hour, picked.minute); } })),
                 const SizedBox(height: 8),
                 FilledButton(onPressed: () => Navigator.pop(sheetContext), child: const Text('بازگشت به تمرین')),
               ]))),
@@ -545,85 +794,82 @@ class _TrainerPageState extends State<TrainerPage> {
         },
       ),
     );
+    if (mounted) newQuestion();
   }
 
   @override
   Widget build(BuildContext context) => Scaffold(
     body: SafeArea(child: LayoutBuilder(builder: (context, constraints) {
+      final landscape = constraints.maxWidth > constraints.maxHeight;
       final compact = constraints.maxHeight < 700;
-      return Column(children: [
-        Padding(padding: const EdgeInsets.fromLTRB(14, 10, 14, 7), child: Row(children: [
-          const Icon(Icons.piano, color: Color(0xFF2B6950), size: 29),
-          const SizedBox(width: 8),
-          const Expanded(child: Text('نت‌خوان پیانو', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800))),
-          IconButton(tooltip: 'تئوری موسیقی', onPressed: openTheory, icon: const Icon(Icons.menu_book_outlined)),
-          IconButton(tooltip: 'تنظیمات', onPressed: openSettings, icon: const Icon(Icons.tune)),
-          IconButton(tooltip: 'شروع دوباره', onPressed: resetScores, icon: const Icon(Icons.restart_alt)),
-        ])),
-        Padding(padding: const EdgeInsets.symmetric(horizontal: 14), child: Row(children: [
-          _stat('درست', '$correct'), const SizedBox(width: 7),
-          _stat('پشت‌سرهم', '$streak'), const SizedBox(width: 7),
-          _stat('دقت', attempts == 0 ? '—' : '${(correct * 100 / attempts).round()}٪'),
-        ])),
-        const SizedBox(height: 8),
-        Padding(padding: const EdgeInsets.symmetric(horizontal: 14), child: Row(children: [
-          const Text('سرعت:', style: TextStyle(fontWeight: FontWeight.w700)),
-          const SizedBox(width: 8),
-          Expanded(child: SizedBox(height: 38, child: ListView(
-            scrollDirection: Axis.horizontal, reverse: true,
-            children: [for (final p in Pace.values) Padding(
-              padding: const EdgeInsets.only(left: 4),
-              child: ChoiceChip(label: Text(p.title, style: const TextStyle(fontSize: 12)),
-                selected: pace == p, onSelected: (_) => updateSettings(() => pace = p)),
-            )],
-          ))),
-        ])),
-        const SizedBox(height: 8),
-        Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 14), child: Container(
-          width: double.infinity,
-          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: const Color(0xFFE8EAE3))),
-          child: Column(children: [
-            Padding(padding: const EdgeInsets.fromLTRB(12, 10, 12, 0), child: Row(children: [
-              Expanded(child: Text(drill == Drill.single ? 'این چه نتی است؟' :
-                drill == Drill.song ? '${currentSong.title}: نت ${melodyIndex + 1} از ${phrase.length}' :
-                'ملودی: نت ${melodyIndex + 1} از ${phrase.length}',
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800))),
-              if (pace.seconds != 0) Text('$secondsLeft ثانیه', style: const TextStyle(fontWeight: FontWeight.bold)),
-            ])),
-            Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 7),
-              child: CustomPaint(painter: StaffPainter(
-                notes: drill == Drill.song ? phrase.skip((melodyIndex ~/ 4) * 4).take(4).toList() : phrase,
-                activeIndex: drill == Drill.song ? melodyIndex % 4 : melodyIndex, clef: effectiveClef,
-                beats: drill == Drill.song ? currentSong.beats.skip((melodyIndex ~/ 4) * 4).take(4).toList() : null,
-                success: locked && pressedMidi == target.midi),
-                child: const SizedBox.expand()))),
-            if (drill == Drill.song && checkRhythm)
-              Text('♩ = $bpm BPM  •  کشش: ${currentSong.beats[melodyIndex]} ضرب  •  شروع و رهاکردن نت مهم است',
-                textAlign: TextAlign.center, style: const TextStyle(fontSize: 11)),
-            Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: Text(status,
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: compact ? 12 : 15, fontWeight: FontWeight.w800, color: statusColor))),
-            TextButton.icon(onPressed: () => setState(() => revealAnswer = !revealAnswer),
-              icon: Icon(revealAnswer ? Icons.visibility_off : Icons.visibility, size: 17),
-              label: Text(revealAnswer ? 'پنهان کردن پاسخ' : 'نمایش پاسخ')),
-            if (revealAnswer) Padding(padding: const EdgeInsets.only(bottom: 7),
-              child: Text(target.label(naming), style: const TextStyle(fontWeight: FontWeight.w800))),
-          ]),
+      final header = Padding(padding: EdgeInsets.fromLTRB(landscape ? 8 : 14, landscape ? 2 : 10, landscape ? 8 : 14, 4), child: Row(children: [
+        const Icon(Icons.piano, color: Color(0xFF2B6950), size: 27),
+        const SizedBox(width: 6),
+        const Expanded(child: Text('نت‌خوان پیانو', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800))),
+        IconButton(visualDensity: VisualDensity.compact, tooltip: 'گزارش پیشرفت', onPressed: openDashboard, icon: const Icon(Icons.insights)),
+        IconButton(visualDensity: VisualDensity.compact, tooltip: 'تئوری موسیقی', onPressed: openTheory, icon: const Icon(Icons.menu_book_outlined)),
+        IconButton(visualDensity: VisualDensity.compact, tooltip: 'چرخش صفحه', onPressed: () => setOrientation(orientationMode == 'landscape' ? 'portrait' : 'landscape'), icon: const Icon(Icons.screen_rotation)),
+        IconButton(visualDensity: VisualDensity.compact, tooltip: 'تنظیمات', onPressed: openSettings, icon: const Icon(Icons.tune)),
+      ]));
+      final stats = Padding(padding: const EdgeInsets.symmetric(horizontal: 10), child: Row(children: [
+        _stat('درست', '$correct'), const SizedBox(width: 5),
+        _stat('پشت‌سرهم', '$streak'), const SizedBox(width: 5),
+        _stat('دقت', attempts == 0 ? '—' : '${(correct * 100 / attempts).round()}٪'),
+      ]));
+      final paceControl = Padding(padding: const EdgeInsets.symmetric(horizontal: 10), child: Row(children: [
+        const Text('سرعت:', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12)),
+        const SizedBox(width: 6),
+        Expanded(child: SizedBox(height: 34, child: ListView(scrollDirection: Axis.horizontal, reverse: true,
+          children: [for (final p in Pace.values) Padding(padding: const EdgeInsets.only(left: 4),
+            child: ChoiceChip(label: Text(p.title, style: const TextStyle(fontSize: 11)), selected: pace == p,
+              onSelected: (_) => updateSettings(() => pace = p)))],
         ))),
-        Padding(padding: const EdgeInsets.symmetric(horizontal: 14), child: Row(children: [
-          Text(drill == Drill.song ? 'آهنگ • کلید سل' : '${clef == Clef.treble ? 'کلید سل' : 'کلید فا'} • مرحله $stage',
-            style: const TextStyle(fontSize: 12)),
-          const Spacer(),
-          TextButton(onPressed: newQuestion, child: const Text('نت بعدی')),
-        ])),
-        SizedBox(height: compact ? 143 : 174, child: PianoKeyboard(
-          startOctave: effectiveOctave, octaveCount: effectiveClef == Clef.bass ? 3 : 2,
-          pressedMidi: pressedMidi,
-          naming: naming, showLabels: showKeyLabels, onPressed: onKey, onTouchDown: playSound,
-        )),
-        const SizedBox(height: 8),
-      ]);
+      ]));
+      final songSpeedControl = drill == Drill.song ? Padding(padding: const EdgeInsets.symmetric(horizontal: 10), child: Row(children: [
+        const Text('تمپو', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+        Expanded(child: Slider(min: 25, max: 200, divisions: 35, value: speedPercent.toDouble(), onChanged: (v) => setSongSpeed(v.round()))),
+        SizedBox(width: 40, child: Text('$speedPercent٪', textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+      ])) : const SizedBox.shrink();
+      final practiceCard = Container(
+        width: double.infinity,
+        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(18), border: Border.all(color: const Color(0xFFE8EAE3))),
+        child: Column(children: [
+          Padding(padding: const EdgeInsets.fromLTRB(10, 6, 10, 0), child: Row(children: [
+            Expanded(child: Text(drill == Drill.single ? 'این چه نتی است؟' : drill == Drill.song ? '${currentSong.title}: نت ${melodyIndex + 1} از ${phrase.length}' : 'ملودی: نت ${melodyIndex + 1} از ${phrase.length}', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800))),
+            if (pace.seconds != 0) Text('$secondsLeft ثانیه', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+          ])),
+          Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 6), child:
+            drill == Drill.song && activeSongPlayMode == SongPlayMode.falling
+              ? FallingNotesBoard(song: currentSong, activeIndex: melodyIndex, bpm: effectiveBpm, startAt: songStartTime, speedPercent: speedPercent, naming: naming)
+              : drill == Drill.song && activeSongPlayMode == SongPlayMode.combined
+                ? Column(children: [
+                    Expanded(child: FallingNotesBoard(song: currentSong, activeIndex: melodyIndex, bpm: effectiveBpm, startAt: songStartTime, speedPercent: speedPercent, naming: naming)),
+                    Expanded(child: CustomPaint(painter: StaffPainter(notes: phrase.skip((melodyIndex ~/ 4) * 4).take(4).toList(), activeIndex: melodyIndex % 4, clef: effectiveClef, beats: currentSong.beats.skip((melodyIndex ~/ 4) * 4).take(4).toList(), success: locked && pressedMidi == target.midi), child: const SizedBox.expand())),
+                  ])
+                : CustomPaint(painter: StaffPainter(notes: drill == Drill.song ? phrase.skip((melodyIndex ~/ 4) * 4).take(4).toList() : phrase, activeIndex: drill == Drill.song ? melodyIndex % 4 : melodyIndex, clef: effectiveClef, beats: drill == Drill.song ? currentSong.beats.skip((melodyIndex ~/ 4) * 4).take(4).toList() : null, success: locked && pressedMidi == target.midi), child: const SizedBox.expand())
+          )),
+          if (drill == Drill.song) Padding(padding: const EdgeInsets.symmetric(horizontal: 5), child: Text('♩ = $effectiveBpm BPM • سرعت $speedPercent٪ • کشش ${currentSong.beats[melodyIndex]} ضرب', textAlign: TextAlign.center, style: const TextStyle(fontSize: 10))),
+          Padding(padding: const EdgeInsets.symmetric(horizontal: 6), child: Text(status, textAlign: TextAlign.center, style: TextStyle(fontSize: compact ? 11 : 14, fontWeight: FontWeight.w800, color: statusColor))),
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            TextButton.icon(onPressed: () => setState(() => revealAnswer = !revealAnswer), icon: Icon(revealAnswer ? Icons.visibility_off : Icons.visibility, size: 16), label: Text(revealAnswer ? 'پنهان کردن پاسخ' : 'نمایش پاسخ')),
+            if (revealAnswer) Text(target.label(naming), style: const TextStyle(fontWeight: FontWeight.w800)),
+          ]),
+        ]),
+      );
+      final footer = Padding(padding: const EdgeInsets.symmetric(horizontal: 10), child: Row(children: [
+        Text(drill == Drill.song ? 'آهنگ • کلید سل' : "${clef == Clef.treble ? 'کلید سل' : 'کلید فا'} • اکتاو $selectedOctaveLabel", style: const TextStyle(fontSize: 11)),
+        const Spacer(), TextButton(onPressed: newQuestion, child: const Text('نت بعدی')),
+      ]));
+      final keyboard = PianoKeyboard(startOctave: effectiveOctave, octaveCount: effectiveOctaveCount, pressedMidi: pressedMidi, naming: naming, showLabels: showKeyLabels, onPressed: onKey, onTouchDown: playSound, onTouchCancel: stopSound);
+      if (landscape) {
+        return Row(children: [
+          Expanded(flex: 6, child: Column(children: [header, stats, Expanded(child: practiceCard), footer])),
+          Expanded(flex: 5, child: Column(children: [paceControl, songSpeedControl, Expanded(child: Padding(padding: const EdgeInsets.fromLTRB(3, 3, 8, 8), child: keyboard))])),
+        ]);
+      }
+      return Column(children: [header, stats, const SizedBox(height: 5), paceControl, songSpeedControl, Expanded(child: practiceCard), footer,
+        SizedBox(height: compact ? 112 : 174, child: keyboard), const SizedBox(height: 5)]);
     })),
   );
 
@@ -727,10 +973,77 @@ class StaffPainter extends CustomPainter {
     old.clef != clef || old.success != success || old.beats != beats;
 }
 
+class FallingNotesBoard extends StatefulWidget {
+  const FallingNotesBoard({super.key, required this.song, required this.activeIndex, required this.bpm, required this.startAt, required this.speedPercent, required this.naming});
+  final PracticeSong song;
+  final int activeIndex;
+  final int bpm;
+  final DateTime? startAt;
+  final int speedPercent;
+  final NoteNames naming;
+  @override
+  State<FallingNotesBoard> createState() => _FallingNotesBoardState();
+}
+class _FallingNotesBoardState extends State<FallingNotesBoard> {
+  Timer? repaintTimer;
+  @override
+  void initState() { super.initState(); repaintTimer = Timer.periodic(const Duration(milliseconds: 33), (_) { if (mounted) setState(() {}); }); }
+  @override
+  void didUpdateWidget(covariant FallingNotesBoard oldWidget) { super.didUpdateWidget(oldWidget); }
+  @override
+  void dispose() { repaintTimer?.cancel(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) => CustomPaint(
+    painter: FallingNotesPainter(song: widget.song, activeIndex: widget.activeIndex, bpm: widget.bpm, startAt: widget.startAt, speedPercent: widget.speedPercent, naming: widget.naming),
+    child: const SizedBox.expand());
+}
+class FallingNotesPainter extends CustomPainter {
+  FallingNotesPainter({required this.song, required this.activeIndex, required this.bpm, required this.startAt, required this.speedPercent, required this.naming});
+  final PracticeSong song; final int activeIndex; final int bpm; final DateTime? startAt; final int speedPercent; final NoteNames naming;
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.isEmpty) return;
+    final laneWidth = size.width / 7;
+    final hitY = size.height - 26;
+    final lanePaint = Paint()..color = const Color(0xFFE7ECE7)..strokeWidth = 1;
+    for (var i=0;i<=7;i++) canvas.drawLine(Offset(i*laneWidth,0),Offset(i*laneWidth,size.height),lanePaint);
+    canvas.drawLine(Offset(0,hitY),Offset(size.width,hitY),Paint()..color=const Color(0xFF258454)..strokeWidth=3);
+    final labelPainter = TextPainter(textDirection: TextDirection.rtl);
+    for (var i=0;i<7;i++) {
+      final laneLabel = naming == NoteNames.persian ? persianLetters[i] : naming == NoteNames.english ? noteLetters[i] : '${persianLetters[i]}/${noteLetters[i]}';
+      labelPainter.text=TextSpan(text: laneLabel,style: const TextStyle(color: Color(0xFF8A9690),fontSize:9));
+      labelPainter.layout(); labelPainter.paint(canvas,Offset(i*laneWidth+(laneWidth-labelPainter.width)/2, size.height-15));
+    }
+    final start = startAt;
+    if (start == null) return;
+    final now = DateTime.now();
+    final msPerBeat = 60000.0 / max(1,bpm);
+    final elapsed = now.difference(start).inMilliseconds.toDouble();
+    final pxPerMs = (size.height - 40) / 2600.0;
+    for (var i=activeIndex;i<min(song.notes.length,activeIndex+12);i++) {
+      final priorBeats = song.beats.take(i).fold<double>(0,(a,b)=>a+b);
+      final dueMs = priorBeats*msPerBeat;
+      final y = hitY - (dueMs-elapsed)*pxPerMs;
+      final note = song.notes[i];
+      final lane = noteLetters.indexOf(note.letter);
+      if (y < -30 || y > size.height+30) continue;
+      final barHeight = max(18.0, song.beats[i] * msPerBeat * pxPerMs);
+      final rect = RRect.fromRectAndRadius(Rect.fromLTWH((lane+.5)*laneWidth-laneWidth*.34, y-barHeight, laneWidth*.68, barHeight),const Radius.circular(8));
+      final paint = Paint()..color = i==activeIndex ? const Color(0xFF32865D) : const Color(0xFF9CB8A7);
+      canvas.drawRRect(rect,paint);
+      final noteLabel = naming == NoteNames.persian ? note.persian : naming == NoteNames.english ? note.letter : '${note.persian}/${note.letter}';
+      final tp=TextPainter(text:TextSpan(text:noteLabel,style:TextStyle(color:Colors.white,fontWeight:FontWeight.bold,fontSize:naming == NoteNames.both ? 9 : 12)),textDirection:TextDirection.ltr)..layout();
+      tp.paint(canvas,Offset((lane+.5)*laneWidth-tp.width/2,y-tp.height/2));
+    }
+  }
+  @override
+  bool shouldRepaint(covariant FallingNotesPainter old) => old.activeIndex!=activeIndex || old.startAt!=startAt || old.bpm!=bpm || old.speedPercent!=speedPercent || old.naming!=naming || old.song!=song;
+}
+
 class PianoKeyboard extends StatelessWidget {
   const PianoKeyboard({super.key, required this.startOctave, required this.octaveCount,
     required this.pressedMidi, required this.naming,
-    required this.showLabels, required this.onPressed, required this.onTouchDown});
+    required this.showLabels, required this.onPressed, required this.onTouchDown, required this.onTouchCancel});
   final int startOctave;
   final int octaveCount;
   final int? pressedMidi;
@@ -738,6 +1051,7 @@ class PianoKeyboard extends StatelessWidget {
   final bool showLabels;
   final void Function(int, Duration) onPressed;
   final ValueChanged<int> onTouchDown;
+  final ValueChanged<int> onTouchCancel;
 
   @override
   Widget build(BuildContext context) => LayoutBuilder(builder: (context, bounds) {
@@ -757,7 +1071,7 @@ class PianoKeyboard extends StatelessWidget {
       child: SizedBox(width: width, height: bounds.maxHeight,
         child: Directionality(textDirection: TextDirection.ltr, child: Stack(children: [
           Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            for (final midi in whites) Expanded(child: NoteKeyTouch(midi: midi, onRelease: onPressed, onDown: onTouchDown, child: Container(
+            for (final midi in whites) Expanded(child: NoteKeyTouch(midi: midi, onRelease: onPressed, onDown: onTouchDown, onCancel: onTouchCancel, child: Container(
                 margin: const EdgeInsets.symmetric(horizontal: .6),
                 decoration: BoxDecoration(
                   color: pressedMidi == midi ? const Color(0xFFB9E5C5) : Colors.white,
@@ -776,7 +1090,7 @@ class PianoKeyboard extends StatelessWidget {
             Positioned(left: (octave * 7 + blackKeyIndices[b] + 1) * keyWidth - keyWidth * .31,
               top: 0, width: keyWidth * .62, height: bounds.maxHeight * .59,
               child: NoteKeyTouch(midi: base + octave * 12 + blackKeySemitones[b],
-                onRelease: onPressed, onDown: onTouchDown, child: Container(decoration: BoxDecoration(
+                onRelease: onPressed, onDown: onTouchDown, onCancel: onTouchCancel, child: Container(decoration: BoxDecoration(
                   color: pressedMidi == base + octave * 12 + blackKeySemitones[b]
                     ? const Color(0xFF47836A) : const Color(0xFF263630),
                   borderRadius: const BorderRadius.vertical(bottom: Radius.circular(5)),
@@ -802,10 +1116,11 @@ class PianoKeyboard extends StatelessWidget {
 /// Measures actual finger-hold duration rather than only counting key taps.
 /// Does not synthesize duration from a fixed timer; rhythm scoring uses input.
 class NoteKeyTouch extends StatefulWidget {
-  const NoteKeyTouch({super.key, required this.midi, required this.onRelease, required this.onDown, required this.child});
+  const NoteKeyTouch({super.key, required this.midi, required this.onRelease, required this.onDown, required this.onCancel, required this.child});
   final int midi;
   final void Function(int, Duration) onRelease;
   final ValueChanged<int> onDown;
+  final ValueChanged<int> onCancel;
   final Widget child;
   @override
   State<NoteKeyTouch> createState() => _NoteKeyTouchState();
@@ -821,9 +1136,50 @@ class _NoteKeyTouchState extends State<NoteKeyTouch> {
       started = null;
       if (start != null) widget.onRelease(widget.midi, DateTime.now().difference(start));
     },
-    onTapCancel: () => started = null,
+    onTapCancel: () { started = null; widget.onCancel(widget.midi); },
     child: widget.child,
   );
+}
+
+class ProgressDashboard extends StatelessWidget {
+  const ProgressDashboard({super.key, required this.secondsByDay, required this.correctByDay, required this.attemptsByDay});
+  final Map<String, int> secondsByDay, correctByDay, attemptsByDay;
+  String keyFor(DateTime d) => '${d.year.toString().padLeft(4,"0")}-${d.month.toString().padLeft(2,"0")}-${d.day.toString().padLeft(2,"0")}';
+  int secondsFor(DateTime d) => secondsByDay[keyFor(d)] ?? 0;
+  String durationLabel(int seconds) => seconds >= 3600 ? '${seconds ~/ 3600} ساعت و ${(seconds % 3600) ~/ 60} دقیقه' : '${seconds ~/ 60} دقیقه';
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final todaySeconds = secondsFor(now);
+    final weekDays = List.generate(7, (i) => DateTime(now.year, now.month, now.day).subtract(Duration(days: 6-i)));
+    final weekSeconds = weekDays.fold<int>(0, (sum, d) => sum + secondsFor(d));
+    final monthDays = List.generate(now.day, (i) => DateTime(now.year, now.month, i+1));
+    final monthSeconds = monthDays.fold<int>(0, (sum, d) => sum + secondsFor(d));
+    final activeDays = monthDays.where((d) => secondsFor(d) >= 60).length;
+    final todayKey = keyFor(now);
+    final todayAttempts = attemptsByDay[todayKey] ?? 0;
+    final todayCorrect = correctByDay[todayKey] ?? 0;
+    final accuracy = todayAttempts == 0 ? 0 : (100 * todayCorrect / todayAttempts).round();
+    return Scaffold(appBar: AppBar(title: const Text('گزارش پیشرفت تمرین')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        _summaryCard('امروز', durationLabel(todaySeconds), '$todayCorrect نت صحیح از $todayAttempts تلاش • دقت $accuracy٪', Icons.today),
+        const SizedBox(height: 12),
+        _summaryCard('این هفته', durationLabel(weekSeconds), '${weekDays.where((d) => secondsFor(d) >= 60).length} روز تمرین در ۷ روز اخیر', Icons.date_range),
+        const SizedBox(height: 12),
+        _summaryCard('این ماه', durationLabel(monthSeconds), '$activeDays روز فعال در ماه جاری', Icons.calendar_month),
+        const SizedBox(height: 18),
+        const Text('فعالیت هفت روز اخیر', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Row(crossAxisAlignment: CrossAxisAlignment.end, children: [for (final d in weekDays) Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 4), child: Column(children: [
+          Text('${secondsFor(d) ~/ 60}', style: const TextStyle(fontSize: 10)),
+          Container(height: max(5.0, min(100.0, secondsFor(d) / max(1, weekSeconds) * 100)).toDouble(), decoration: BoxDecoration(color: secondsFor(d) >= 60 ? const Color(0xFF39835F) : const Color(0xFFD8DED8), borderRadius: BorderRadius.circular(6))),
+          const SizedBox(height: 5), Text(['ی','د','س','چ','پ','ج','ش'][d.weekday % 7], style: const TextStyle(fontSize: 11)),
+        ])))]),
+      ]));
+  }
+  Widget _summaryCard(String title, String value, String detail, IconData icon) => Card(child: Padding(padding: const EdgeInsets.all(16), child: Row(children: [
+    CircleAvatar(child: Icon(icon)), const SizedBox(width: 12), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: const TextStyle(fontWeight: FontWeight.bold)), Text(value, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)), Text(detail, style: const TextStyle(fontSize: 12))])),
+  ])));
 }
 
 class TheoryLesson {
