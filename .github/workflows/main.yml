@@ -1,0 +1,89 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test and build release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show toolchain versions
+        run: |
+          flutter --version
+          java -version
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Run Dart and widget tests
+        run: flutter test
+
+      # This source package intentionally keeps its custom MainActivity and
+      # Android Gradle files, but does not include Gradle wrapper binaries.
+      # Generate a temporary Android shell and copy only the wrapper files.
+      - name: Provision Gradle wrapper without replacing app sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          SEED="$RUNNER_TEMP/piano_android_seed"
+          flutter create \
+            --platforms=android \
+            --project-name=pianotrainer \
+            --org=com.dadfaran \
+            --android-language=kotlin \
+            "$SEED"
+
+          mkdir -p android/gradle/wrapper
+          cp "$SEED/android/gradlew" android/gradlew
+          cp "$SEED/android/gradlew.bat" android/gradlew.bat
+          cp "$SEED/android/gradle/wrapper/gradle-wrapper.jar" android/gradle/wrapper/
+
+          cat > android/gradle/wrapper/gradle-wrapper.properties <<'PROPERTIES'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.9-bin.zip
+          networkTimeout=10000
+          validateDistributionUrl=true
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          PROPERTIES
+
+          chmod +x android/gradlew
+          test -f android/app/src/main/kotlin/com/dadfaran/pianotrainer/MainActivity.kt
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: piano-note-trainer-android-v1.3.0
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
